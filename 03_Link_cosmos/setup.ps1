@@ -69,7 +69,7 @@ while ($complexPassword -ne 1)
 
 # Register resource providers
 Write-Host "Registering resource providers...";
-$provider_list = "Microsoft.Synapse", "Microsoft.Purview", "Microsoft.Sql", "Microsoft.Storage", "Microsoft.Compute"
+$provider_list = "Microsoft.Synapse", "Microsoft.Sql", "Microsoft.Storage", "Microsoft.Compute", "Microsoft.DocumentDB"
 foreach ($provider in $provider_list){
     $result = Register-AzResourceProvider -ProviderNamespace $provider
     $status = $result.RegistrationState
@@ -79,19 +79,19 @@ foreach ($provider in $provider_list){
 # Generate unique random suffix
 [string]$suffix =  -join ((48..57) + (97..122) | Get-Random -Count 7 | % {[char]$_})
 Write-Host "Your randomly-generated suffix for Azure resources is $suffix"
-$resourceGroupName = "asap10-$suffix"
+$resourceGroupName = "asap02-$suffix"
 
 # Choose a random region
 Write-Host "Finding an available region. This may take several minutes...";
 $delay = 0, 30, 60, 90, 120 | Get-Random
 Start-Sleep -Seconds $delay # random delay to stagger requests from multi-student classes
-$preferred_list = "australiaeast","centralus","southcentralus","eastus2","northeurope","southeastasia","uksouth","westeurope","westus","westus2"
+$preferred_list = "eastus","southcentralus","westus3","australiaeast","northeurope","eastasia","uksouth","swedencentral","japaneast","canadacentral","francecentral","norwayeast"
 $locations = Get-AzLocation | Where-Object {
     $_.Providers -contains "Microsoft.Synapse" -and
     $_.Providers -contains "Microsoft.Sql" -and
     $_.Providers -contains "Microsoft.Storage" -and
     $_.Providers -contains "Microsoft.Compute" -and
-    $_.Providers -contains "Microsoft.Purview" -and
+    $_.Providers -contains "Microsoft.DocumentDB" -and
     $_.Location -in $preferred_list
 }
 $max_index = $locations.Count - 1
@@ -126,6 +126,7 @@ $Region = $locations.Get($rand).Location
             Write-Host "Sorry! Try again later."
             Exit
         }
+        
     }
 }
 Write-Host "Creating $resourceGroupName resource group in $Region ..."
@@ -134,20 +135,18 @@ New-AzResourceGroup -Name $resourceGroupName -Location $Region | Out-Null
 # Create Synapse workspace
 $synapseWorkspace = "synapse$suffix"
 $dataLakeAccountName = "datalake$suffix"
-$sqlDatabaseName = "sql$suffix"
-$purviewAccountName = "purview$suffix"
+$sparkPool = "spark$suffix"
 
-write-host "Creating Azure resources in $resourceGroupName resource group..."
+write-host "Creating $synapseWorkspace Synapse Analytics workspace in $resourceGroupName resource group..."
 New-AzResourceGroupDeployment -ResourceGroupName $resourceGroupName `
   -TemplateFile "setup.json" `
   -Mode Complete `
   -workspaceName $synapseWorkspace `
   -dataLakeAccountName $dataLakeAccountName `
-  -uniqueSuffix $suffix `
-  -sqlDatabaseName $sqlDatabaseName `
+  -sparkPoolName $sparkPool `
   -sqlUser $sqlUser `
   -sqlPassword $sqlPassword `
-  -purviewAccountName $purviewAccountName `
+  -uniqueSuffix $suffix `
   -Force
 
 # Make the current user and the Synapse service principal owners of the data lake blob store
@@ -159,29 +158,36 @@ $id = (Get-AzADServicePrincipal -DisplayName $synapseWorkspace).id
 New-AzRoleAssignment -Objectid $id -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
 New-AzRoleAssignment -SignInName $userName -RoleDefinitionName "Storage Blob Data Owner" -Scope "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$dataLakeAccountName" -ErrorAction SilentlyContinue;
 
-# Upload files
-write-host "Loading data to data lake..."
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $dataLakeAccountName
-$storageContext = $storageAccount.Context
-Get-ChildItem "./data/*.csv" -File | Foreach-Object {
-    write-host ""
-    $file = $_.Name
-    Write-Host $file
-    $blobPath = "products/$file"
-    Set-AzStorageBlobContent -File $_.FullName -Container "files" -Blob $blobPath -Context $storageContext
+Write-Host "Creating Cosmos DB account...";
+# Try the same region as Synapse, and if that fails try others...
+$stop = 0
+$attempt = 0
+$tried_cosmos = New-Object Collections.Generic.List[string]
+while ($stop -ne 1){
+    try {
+        write-host "Trying $Region..."
+        $attempt = $attempt + 1
+        $cosmosDB = "cosmos$suffix$attempt"
+        New-AzCosmosDBAccount -ResourceGroupName $resourceGroupName -Name $cosmosDB -Location $Region -ErrorAction Stop | Out-Null
+        $stop = 1
+    }
+    catch {
+      $stop = 0
+      Remove-AzCosmosDBAccount -ResourceGroupName $resourceGroupName -Name $cosmosDB -AsJob | Out-Null
+      $tried_cosmos.Add($Region)
+      $locations = $locations | Where-Object {$_.Location -notin $tried_cosmos}
+      if ($locations.Count -ne 1)
+      {
+        $rand = (0..$($locations.Count - 1)) | Get-Random
+        $Region = $locations.Get($rand).Location
+      }
+      else {
+          Write-Host "Could not create a Cosmos DB account."
+          Write-Host "Use the Azure portal to add one to the $resourceGroupName resource group."
+          $stop = 1
+      }
+    }
 }
 
-# Create database
-write-host "Creating databases..."
-$serverlessSQL = Get-Content -Path "serverless.sql" -Raw
-$serverlessSQL = $serverlessSQL.Replace("datalakexxxxxxx", $dataLakeAccountName)
-Set-Content -Path "serverless$suffix.sql" -Value $serverlessSQL
-sqlcmd -S "$synapseWorkspace-ondemand.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d master -I -i serverless$suffix.sql
-sqlcmd -S "$synapseWorkspace.sql.azuresynapse.net" -U $sqlUser -P $sqlPassword -d $sqlDatabaseName -I -i dedicated.sql
-
-
-# Pause SQL Pool
-write-host "Pausing the $sqlDatabaseName SQL Pool..."
-Suspend-AzSynapseSqlPool -WorkspaceName $synapseWorkspace -Name $sqlDatabaseName -AsJob
 
 write-host "Script completed at $(Get-Date)"
